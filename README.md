@@ -1,6 +1,6 @@
 # TermuxMitM 🐉
 
-## 🇺🇸 | [🇮🇹](https://github.com/n0nexist/TermuxMitM#-ITALIANO)
+## 🇺🇸 | [🇮🇹](https://github.com/n0nexist/TermuxMitM#-Building)
 
 **Man-in-the-Middle attack on your Android phone.** 📱💀
 
