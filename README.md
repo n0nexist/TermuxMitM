@@ -50,8 +50,7 @@ pkg install clang
 clang -O2 -pthread -o universalMITM universalMitM.c
 ```
 
-**ITALIANO**
-# TermuxMitM 🐉
+# TermuxMitM | ITALIANO 🐉
 
 **Attacco Man-in-the-Middle sul tuo telefono Android.** 📱💀
 
