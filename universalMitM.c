@@ -37,6 +37,66 @@ static volatile int running = 1;
 #define STOP_SCRIPT  "FORWARDING/stop_mitm.sh"
 
 // ============================================================
+// OUI DATABASE
+// ============================================================
+
+#define MAX_OUI 60000
+
+struct oui_entry {
+    uint32_t prefix;
+    char     vendor[64];
+};
+
+static struct oui_entry *oui_db = NULL;
+static int oui_count = 0;
+
+static void load_oui_db(const char *filename) {
+    FILE *f = fopen(filename, "r");
+    if (!f) {
+        fprintf(stderr, "[!] Impossibile aprire %s, vendor disabilitati\n", filename);
+        return;
+    }
+
+    oui_db = malloc(sizeof(struct oui_entry) * MAX_OUI);
+    if (!oui_db) { fclose(f); return; }
+
+    char line[512];
+    while (fgets(line, sizeof(line), f) && oui_count < MAX_OUI) {
+        char mac_str[18] = {0}, vendor[64] = {0};
+        
+        char *p = strstr(line, "mac_prefix=\"");
+        if (!p) continue;
+        p += 12;
+        if (sscanf(p, "%17[^\"]", mac_str) != 1) continue;
+
+        p = strstr(line, "vendor_name=\"");
+        if (!p) continue;
+        p += 13;
+        if (sscanf(p, "%63[^\"]", vendor) != 1) continue;
+
+        unsigned int b1, b2, b3;
+        if (sscanf(mac_str, "%x:%x:%x", &b1, &b2, &b3) != 3) continue;
+
+        oui_db[oui_count].prefix = (b1 << 16) | (b2 << 8) | b3;
+        strncpy(oui_db[oui_count].vendor, vendor, sizeof(oui_db[oui_count].vendor) - 1);
+        oui_count++;
+    }
+    fclose(f);
+    printf("[OUI] Caricati %d prefissi vendor\n", oui_count);
+}
+
+static const char* lookup_vendor(const uint8_t *mac) {
+    if (!oui_db || oui_count == 0) return "Unknown";
+    uint32_t prefix = (mac[0] << 16) | (mac[1] << 8) | mac[2];
+    for (int i = 0; i < oui_count; i++) {
+        if (oui_db[i].prefix == prefix) {
+            return oui_db[i].vendor;
+        }
+    }
+    return "Unknown";
+}
+
+// ============================================================
 // STRUTTURE
 // ============================================================
 
@@ -207,25 +267,23 @@ static void scan_subnet_arp(void) {
     printf("[*] invio ARP request in broadcast...\n");
     uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
-    // Invia richiesta ARP per tutti gli IP della subnet
     for (int i = 1; i <= 254; i++) {
         base[3] = i;
         if (memcmp(base, my_ip, 4) == 0) continue;
         send_arp(bcast, my_mac, my_ip, NULL, base, 1);
-        usleep(1000); // 1ms tra un pacchetto e l'altro
+        usleep(1000);
     }
 
     printf("[*] in ascolto di risposte ARP per 3 secondi...\n");
     struct timeval start, now, tv;
     gettimeofday(&start, NULL);
     tv.tv_sec = 0;
-    tv.tv_usec = 100000; // Timeout di 100ms per singola recv
+    tv.tv_usec = 100000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     uint8_t buf[1024];
     while (1) {
         gettimeofday(&now, NULL);
-        // Esci dal loop dopo 3 secondi totali
         if (now.tv_sec - start.tv_sec >= 3) break;
 
         int len = recv(sock, buf, sizeof(buf), 0);
@@ -247,8 +305,15 @@ static void scan_subnet_arp(void) {
                 memcpy(hosts[n_hosts].ip, f->arp_spa, 4);
                 memcpy(hosts[n_hosts].mac, f->arp_sha, 6);
                 n_hosts++;
+                
                 char *ip_str = convert_ip(f->arp_spa);
-                printf("[*] Trovato: %s\n", ip_str);
+                const char *vendor = lookup_vendor(f->arp_sha);
+                
+                printf("[*] Trovato: %s (%02x:%02x:%02x:%02x:%02x:%02x) - %s\n",
+                       ip_str,
+                       f->arp_sha[0], f->arp_sha[1], f->arp_sha[2],
+                       f->arp_sha[3], f->arp_sha[4], f->arp_sha[5],
+                       vendor);
                 free(ip_str);
             }
         }
@@ -300,6 +365,9 @@ int main(int argc, char **argv) {
     iface = argv[1];
 
     signal(SIGINT, on_sigint);
+
+    // Carica il database dei vendor
+    load_oui_db("vendorMacs.xml");
 
     if (get_iface_mac(iface, my_mac) < 0 || get_iface_ip(iface, my_ip) < 0) {
         fprintf(stderr, "impossibile leggere MAC/IP di %s\n", iface);
@@ -371,6 +439,8 @@ int main(int argc, char **argv) {
 
     printf("[*] disattivo IP forwarding...\n");
     ferma_ipForwarding();
+
+    if (oui_db) free(oui_db);
 
     printf("[*] done.\n");
     return 0;
